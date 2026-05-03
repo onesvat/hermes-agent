@@ -283,6 +283,7 @@ Control how much tool activity is displayed in `~/.hermes/config.yaml`:
 display:
   tool_progress: all    # off | new | all | verbose
   tool_progress_command: false  # set to true to enable /verbose in messaging
+  combine_segments: false  # with streaming.enabled=true, combine progress + final in one edited message
 ```
 
 When enabled, the bot sends status messages as it works:

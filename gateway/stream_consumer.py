@@ -44,6 +44,14 @@ _NEW_SEGMENT = object()
 # API/tool iterations (for example: "I'll inspect the repo first.").
 _COMMENTARY = object()
 
+# Queue marker for tool progress lines when the gateway is configured to
+# combine stream text, progress, commentary, and final text in one message.
+_TOOL_PROGRESS = object()
+
+# Queue marker for final text that may not have arrived through token deltas
+# (for example after a non-streaming retry or final post-processing).
+_FINAL_TEXT = object()
+
 
 @dataclass
 class StreamConsumerConfig:
@@ -72,6 +80,10 @@ class StreamConsumerConfig:
     # "group", "supergroup", "forum").  Used to gate native draft streaming,
     # which is platform-specific (Telegram drafts are DM-only).
     chat_type: str = ""
+    # When true, keep assistant deltas, interim commentary, tool progress,
+    # and final text in one editable message instead of splitting at tool
+    # boundaries or sending commentary/progress as separate bubbles.
+    combine_segments: bool = False
 
 
 class GatewayStreamConsumer:
@@ -195,6 +207,16 @@ class GatewayStreamConsumer:
         """Queue a completed interim assistant commentary message."""
         if text:
             self._queue.put((_COMMENTARY, text))
+
+    def on_tool_progress(self, text: str) -> None:
+        """Queue a tool progress line for combined-segment rendering."""
+        if text:
+            self._queue.put((_TOOL_PROGRESS, text))
+
+    def on_final_response(self, text: str) -> None:
+        """Queue final response text for combined-segment rendering."""
+        if text:
+            self._queue.put((_FINAL_TEXT, text))
 
     def _notify_new_message(self) -> None:
         """Fire the on_new_message callback, swallowing any errors."""
@@ -348,6 +370,35 @@ class GatewayStreamConsumer:
             self._accumulated += self._think_buffer
             self._think_buffer = ""
 
+    def _append_combined_block(self, text: str) -> None:
+        """Append a commentary/progress block with readable separation."""
+        text = self._clean_for_display(str(text or "")).strip()
+        if not text:
+            return
+        if self._accumulated and not self._accumulated.endswith("\n"):
+            self._accumulated += "\n"
+        self._accumulated += text
+        if not self._accumulated.endswith("\n"):
+            self._accumulated += "\n"
+
+    def _append_final_response(self, text: str) -> None:
+        """Append final text only when token streaming did not already do it."""
+        final_text = self._clean_for_display(str(text or "")).strip()
+        if not final_text or final_text == "(empty)":
+            return
+        current = self._clean_for_display(self._accumulated).rstrip()
+        if not current:
+            self._accumulated = final_text
+            return
+        if current.endswith(final_text) or final_text in current:
+            return
+        if final_text.startswith(current):
+            self._accumulated += final_text[len(current):]
+            return
+        if not self._accumulated.endswith("\n"):
+            self._accumulated += "\n"
+        self._accumulated += final_text
+
     async def run(self) -> None:
         """Async task that drains the queue and edits the platform message."""
         # Platform message length limit — leave room for cursor + formatting.
@@ -382,6 +433,7 @@ class GatewayStreamConsumer:
                 # Drain all available items from the queue
                 got_done = False
                 got_segment_break = False
+                got_combined_event = False
                 commentary_text = None
                 while True:
                     try:
@@ -390,11 +442,28 @@ class GatewayStreamConsumer:
                             got_done = True
                             break
                         if item is _NEW_SEGMENT:
+                            if self.cfg.combine_segments:
+                                got_combined_event = True
+                                continue
                             got_segment_break = True
                             break
                         if isinstance(item, tuple) and len(item) == 2 and item[0] is _COMMENTARY:
+                            if self.cfg.combine_segments:
+                                self._append_combined_block(item[1])
+                                got_combined_event = True
+                                continue
                             commentary_text = item[1]
                             break
+                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _TOOL_PROGRESS:
+                            if self.cfg.combine_segments:
+                                self._append_combined_block(item[1])
+                                got_combined_event = True
+                            continue
+                        if isinstance(item, tuple) and len(item) == 2 and item[0] is _FINAL_TEXT:
+                            if self.cfg.combine_segments:
+                                self._append_final_response(item[1])
+                                got_combined_event = True
+                            continue
                         self._filter_and_accumulate(item)
                     except queue.Empty:
                         break
@@ -412,6 +481,7 @@ class GatewayStreamConsumer:
                     got_done
                     or got_segment_break
                     or commentary_text is not None
+                    or got_combined_event
                 )
                 if not self.cfg.buffer_only:
                     should_edit = should_edit or (

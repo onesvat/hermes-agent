@@ -9,6 +9,18 @@ import pytest
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 
 
+def _editable_adapter():
+    adapter = MagicMock()
+    adapter.send = AsyncMock(return_value=SimpleNamespace(
+        success=True,
+        message_id="msg_1",
+    ))
+    adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+    adapter.MAX_MESSAGE_LENGTH = 4096
+    adapter.SUPPORTS_MESSAGE_EDITING = True
+    return adapter
+
+
 # ── _clean_for_display unit tests ────────────────────────────────────────
 
 
@@ -83,6 +95,75 @@ class TestCleanForDisplay:
         # "MEDIA:" in upper case without a path won't match \S+ (space follows)
         # But "media:" is lowercase so won't match either
         assert result == text
+
+
+class TestCombinedSegments:
+    """Combined rendering keeps stream, progress, commentary, and final together."""
+
+    @pytest.mark.asyncio
+    async def test_combines_stream_commentary_progress_and_final(self):
+        adapter = _editable_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor="", combine_segments=True),
+        )
+
+        consumer.on_delta("Working")
+        consumer.on_commentary("Checking the repo")
+        consumer.on_tool_progress("💻 terminal...")
+        consumer.on_final_response("Final answer")
+        consumer.finish()
+        await consumer.run()
+
+        adapter.send.assert_called_once()
+        sent = adapter.send.call_args[1]["content"]
+        assert "Working" in sent
+        assert "Checking the repo" in sent
+        assert "💻 terminal..." in sent
+        assert "Final answer" in sent
+        assert consumer.final_response_sent is True
+
+    @pytest.mark.asyncio
+    async def test_final_response_not_duplicated_when_already_streamed(self):
+        adapter = _editable_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor="", combine_segments=True),
+        )
+
+        consumer.on_delta("Final answer")
+        consumer.on_final_response("Final answer")
+        consumer.finish()
+        await consumer.run()
+
+        sent = adapter.send.call_args[1]["content"]
+        assert sent == "Final answer"
+        assert consumer.final_response_sent is True
+
+    @pytest.mark.asyncio
+    async def test_segment_break_does_not_start_new_message_in_combine_mode(self):
+        adapter = _editable_adapter()
+        consumer = GatewayStreamConsumer(
+            adapter,
+            "chat_123",
+            StreamConsumerConfig(cursor="", combine_segments=True),
+        )
+
+        consumer.on_delta("Before tool")
+        consumer.on_segment_break()
+        consumer.on_tool_progress("🔍 web_search...")
+        consumer.on_delta("After tool")
+        consumer.finish()
+        await consumer.run()
+
+        adapter.send.assert_called_once()
+        assert adapter.edit_message.call_count == 0
+        sent = adapter.send.call_args[1]["content"]
+        assert "Before tool" in sent
+        assert "🔍 web_search..." in sent
+        assert "After tool" in sent
 
 
 # ── Integration: _send_or_edit strips MEDIA: ─────────────────────────────

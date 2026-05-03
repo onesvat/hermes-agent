@@ -14234,9 +14234,34 @@ class GatewayRunner:
             if _env_tp and not _tool_progress_configured
             else (_resolved_tp or _env_tp or "all")
         )
-        # Disable tool progress for webhooks - they don't support message editing,
-        # so each progress line would be sent as a separate message.
         from gateway.config import Platform
+        _scfg_for_combine = getattr(getattr(self, "config", None), "streaming", None)
+        if _scfg_for_combine is None:
+            from gateway.config import StreamingConfig
+            _scfg_for_combine = StreamingConfig()
+        _plat_streaming_for_combine = resolve_display_setting(
+            user_config, platform_key, "streaming"
+        )
+        _streaming_enabled_for_combine = (
+            _scfg_for_combine.enabled and _scfg_for_combine.transport != "off"
+            if _plat_streaming_for_combine is None
+            else bool(_plat_streaming_for_combine)
+        )
+        _combine_adapter = self.adapters.get(source.platform)
+        _combine_adapter_supports_edit = bool(
+            _combine_adapter
+            and getattr(_combine_adapter, "SUPPORTS_MESSAGE_EDITING", True)
+        )
+        combine_segments_enabled = (
+            _streaming_enabled_for_combine
+            and source.platform != Platform.WEBHOOK
+            and _combine_adapter_supports_edit
+            and is_truthy_value(display_config.get("combine_segments"), default=False)
+        )
+        # Disable tool progress for webhooks - they don't support message editing,
+        # so each progress line would be sent as a separate message. In combined
+        # mode, progress still uses this callback but is rendered by the stream
+        # consumer instead of the standalone progress bubble task.
         tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
         # Natural assistant status messages are intentionally independent from
         # tool progress and token streaming. Users can keep tool_progress quiet
@@ -14254,7 +14279,7 @@ class GatewayRunner:
         last_tool = [None]  # Mutable container for tracking in closure
         last_progress_msg = [None]  # Track last message for dedup
         repeat_count = [0]  # How many times the same message repeated
-
+        
         # Auto-cleanup of temporary progress bubbles (Telegram + any adapter
         # that implements ``delete_message``). When enabled via
         # ``display.platforms.<platform>.cleanup_progress: true``, message IDs
@@ -14272,14 +14297,28 @@ class GatewayRunner:
             _cleanup_progress = False
             _cleanup_adapter = None
         _cleanup_msg_ids: List[str] = []
+        stream_consumer_holder = [None]  # Mutable container for stream consumer
         # First-touch onboarding latch: fires at most once per run, even if
         # several tools exceed the threshold.
         long_tool_hint_fired = [False]
         _LONG_TOOL_THRESHOLD_S = 30.0
 
+        if combine_segments_enabled:
+            def _emit_progress(msg: str) -> None:
+                _sc = stream_consumer_holder[0] if stream_consumer_holder else None
+                if _sc is not None:
+                    _sc.on_tool_progress(msg)
+                    return
+                if progress_queue is not None:
+                    progress_queue.put(msg)
+        else:
+            def _emit_progress(msg: str) -> None:
+                if progress_queue is not None:
+                    progress_queue.put(msg)
+
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
-            if not progress_queue or not _run_still_current():
+            if (not progress_queue and not combine_segments_enabled) or not _run_still_current():
                 return
 
             # First-touch onboarding: the first time a tool takes longer than
@@ -14305,7 +14344,7 @@ class GatewayRunner:
                         )
                         if gate_on and not is_seen(_cfg, TOOL_PROGRESS_FLAG):
                             long_tool_hint_fired[0] = True
-                            progress_queue.put(tool_progress_hint_gateway())
+                            _emit_progress(tool_progress_hint_gateway())
                             mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
                 except Exception as _hint_err:
                     logger.debug("tool-progress onboarding hint failed: %s", _hint_err)
@@ -14357,7 +14396,7 @@ class GatewayRunner:
                     msg = f"{emoji} {tool_name}: \"{preview}\""
                 else:
                     msg = f"{emoji} {tool_name}..."
-                progress_queue.put(msg)
+                _emit_progress(msg)
                 return
             
             # "all" / "new" modes: short preview, respects tool_preview_length
@@ -14380,12 +14419,15 @@ class GatewayRunner:
                 repeat_count[0] += 1
                 # Update the last line in progress_lines with a counter
                 # via a special "dedup" queue message.
-                progress_queue.put(("__dedup__", msg, repeat_count[0]))
+                if combine_segments_enabled:
+                    _emit_progress(f"{msg} (×{repeat_count[0] + 1})")
+                elif progress_queue is not None:
+                    progress_queue.put(("__dedup__", msg, repeat_count[0]))
                 return
             last_progress_msg[0] = msg
             repeat_count[0] = 0
             
-            progress_queue.put(msg)
+            _emit_progress(msg)
         
         # Background task to send progress messages
         # Accumulates tool lines into a single message that gets edited.
@@ -14619,7 +14661,6 @@ class GatewayRunner:
         agent_holder = [None]  # Mutable container for the agent instance
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
-        stream_consumer_holder = [None]  # Mutable container for stream consumer
         
         # Bridge sync step_callback → async hooks.emit for agent:step events
         _loop_for_step = asyncio.get_running_loop()
@@ -14774,7 +14815,7 @@ class GatewayRunner:
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
             _want_interim_consumer = _want_interim_messages
-            if _want_stream_deltas or _want_interim_consumer:
+            if _want_stream_deltas or _want_interim_consumer or combine_segments_enabled:
                 try:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
                     _adapter = self.adapters.get(source.platform)
@@ -14812,6 +14853,7 @@ class GatewayRunner:
                             fresh_final_after_seconds=_fresh_final_secs,
                             transport=_scfg.transport or "auto",
                             chat_type=getattr(source, "chat_type", "") or "",
+                            combine_segments=combine_segments_enabled,
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
@@ -14820,7 +14862,7 @@ class GatewayRunner:
                             metadata=_status_thread_metadata,
                             on_new_message=(
                                 (lambda: progress_queue.put(("__reset__",)))
-                                if progress_queue is not None
+                                if progress_queue is not None and not combine_segments_enabled
                                 else None
                             ),
                             initial_reply_to_id=event_message_id,
@@ -15343,6 +15385,8 @@ class GatewayRunner:
 
             # Signal the stream consumer that the agent is done
             if _stream_consumer is not None:
+                if combine_segments_enabled:
+                    _stream_consumer.on_final_response(result.get("final_response") or "")
                 _stream_consumer.finish()
             
             # Return final response, or a message if something went wrong

@@ -911,6 +911,13 @@ display:
   #   false: Only send the final response
   interim_assistant_messages: true
 
+  # Gateway-only combined streaming/progress message.
+  # Requires top-level streaming.enabled=true and a platform with message
+  # editing support. When enabled, assistant streaming text, visible tool
+  # progress, visible interim updates, and the final response are accumulated
+  # into one edited message instead of separate chat bubbles.
+  combine_segments: false
+
   # What Enter does when Hermes is already busy (CLI and gateway platforms).
   #   interrupt: Interrupt the current run and redirect Hermes (default)
   #   queue:     Queue your message for the next turn

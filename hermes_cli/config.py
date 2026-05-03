@@ -945,6 +945,7 @@ DEFAULT_CONFIG = {
             "last_lines": 2,
         },
         "interim_assistant_messages": True,  # Gateway: show natural mid-turn assistant status messages
+        "combine_segments": False,  # Gateway: combine streaming text, progress, and final response into one edited message
         "tool_progress_command": False,  # Enable /verbose command in messaging gateway
         "tool_progress_overrides": {},  # DEPRECATED — use display.platforms instead
         "tool_preview_length": 0,  # Max chars for tool call previews (0 = no limit, show full paths/commands)
