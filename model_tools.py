@@ -828,6 +828,17 @@ def handle_function_call(
         except Exception as _hook_err:
             logger.debug("transform_tool_result hook error: %s", _hook_err)
 
+        # Log full tool completion output for debugging (DEBUG level)
+        # This enables debugging via agent.log while keeping Telegram streaming truncated
+        try:
+            logger.debug(
+                f"TOOL_COMPLETION_FULL [{task_id or 'unknown'}]: "
+                f"tool={function_name}, args={json.dumps(function_args, ensure_ascii=False)}, "
+                f"result={result[:50000]}"  # Truncate to 50000 bytes (same as Telegram limit)
+            )
+        except Exception:
+            pass  # Don't break tool execution if logging fails
+
         return result
 
     except Exception as e:
